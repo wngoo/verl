@@ -175,6 +175,73 @@ OOM 발생 시 체크 순서:
 
 ---
 
+## 8. prompt_logprobs OOM: gpu_memory_utilization 공식과 max_num_batched_tokens
+
+### vLLM 메모리 할당 공식
+
+vLLM 시작 시 메모리 할당 순서:
+
+```
+1. 모델 가중치 로드 (고정)
+2. 프로파일링 forward pass 실행 → peak activation 측정
+3. 남은 메모리 계산:
+   remaining = total_gpu_memory - weights - profiling_peak_activation
+
+KV cache     = remaining × gpu_memory_utilization
+free_runtime = remaining × (1 - gpu_memory_utilization)
+```
+
+**핵심 문제**: vLLM의 프로파일링은 **일반 generation 기준**으로 peak activation을 측정한다.
+`prompt_logprobs` 경로(teacher KD)는 프로파일링에 포함되지 않아 실제 런타임에 예상보다 훨씬 큰 activation이 발생한다.
+
+따라서 `gpu_memory_utilization`을 낮추면:
+```
+KV cache 감소 → free_runtime 증가 → prompt_logprobs log_softmax 텐서를 위한 여유 공간 확보
+```
+
+### log_softmax 텐서 크기 공식
+
+`compute_logprobs`의 `log_softmax`가 할당하는 메모리:
+
+```
+logits_memory = max_num_batched_tokens × vocab_size × 4 bytes (float32)
+```
+
+Gemma4 (vocab ≈ 256,128) 기준 실측:
+
+| max_num_batched_tokens | logits 메모리 |
+|---|---|
+| 12,000 (OOM 사례) | ~11.6 GiB |
+| 8,192 | ~7.9 GiB |
+| 4,096 | ~4.0 GiB |
+
+TP(Tensor Parallel)로 logits를 분산해도 `log_softmax`는 full vocab logits를 gather해서 계산하므로 TP를 늘려도 이 메모리는 줄어들지 않는다.
+
+### max_num_batched_tokens 의미와 학습 영향
+
+vLLM이 **단일 forward pass에서 처리하는 최대 토큰 수**.
+
+- 값이 크면 → 긴 시퀀스를 한 번에 처리 → throughput ↑, 메모리 ↑
+- 값이 작으면 → chunked prefill로 나눠 처리 → throughput ↓, 메모리 ↓
+
+**학습 품질에는 영향 없음.** KD에서 teacher는 시퀀스 전체의 `prompt_logprobs`를 얻어야 하지만, chunked prefill로 나눠 처리해도 결과는 동일하다.
+
+### teacher OOM 해결 설정 예시
+
+```bash
+# OOM 발생 시
+distillation.teacher_model.inference.max_num_batched_tokens=4096   # 낮춰서 logits 텐서 축소
+distillation.teacher_model.inference.gpu_memory_utilization=0.5   # 낮춰서 runtime 여유 확보
+```
+
+### teacher OOM vs student OOM 구분
+
+에러 스택에서 `_get_prompt_logprobs_dict` → `compute_logprobs`가 보이면 **무조건 teacher** 쪽 OOM.
+`prompt_logprobs`는 `teacher_manager.py`의 `_get_teacher_sampling_params`에서만 설정하기 때문이다.
+student 롤아웃은 일반 generation을 사용하므로 이 경로로 빠지지 않는다.
+
+---
+
 ## 참고 코드 위치
 
 | 항목 | 위치 |
