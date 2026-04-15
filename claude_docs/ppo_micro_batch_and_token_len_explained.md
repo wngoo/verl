@@ -109,3 +109,56 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 - `verl/workers/actor/dp_actor.py:547-616` — micro_batch 분할 및 gradient accumulation 로직
 - `verl/workers/config/actor.py:145,148` — `ppo_micro_batch_size_per_gpu`, `ppo_max_token_len_per_gpu` 기본값
 - `verl/utils/seqlen_balancing.py` — `prepare_dynamic_batch` / `rearrange_micro_batches` 구현
+
+---
+
+## 신규 engine 구현에서의 정규화 방식 (`use_legacy_worker_impl=disable`)
+
+> 스크립트에 `trainer.use_legacy_worker_impl=disable`이 설정된 경우 아래 구현이 사용된다.
+
+### batch_num_tokens 기반 정규화
+
+`forward_backward_batch()` (`engine/fsdp/transformer_impl.py:595-605`)에서
+**micro-batch로 나누기 전에** 전체 mini-batch의 유효 token 수를 미리 계산한다:
+
+```python
+# micro-batch 분할 전에 global token 수 계산
+batch_num_tokens = data["loss_mask"].sum()
+torch.distributed.all_reduce(batch_num_tokens, ...)   # 전체 DP rank 합산
+tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+
+# 그 다음에 micro-batch 분할
+micro_batches, indices = prepare_micro_batches(data, ...)
+
+for micro_batch in micro_batches:
+    loss, meta = forward_step(micro_batch, loss_fn)
+    loss.backward()
+```
+
+각 micro-batch의 loss는 `agg_loss()` (`core_algos.py:1168-1173`)에서 이 값으로 나뉜다:
+
+```python
+# token-mean 모드 (기본값)
+loss = masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+```
+
+`batch_num_tokens`는 mini-batch 전체 기준이므로, micro-batch를 어떻게 나누든 gradient 크기가 동일하다.
+이것이 legacy 구현(`1 / gradient_accumulation` 스케일)과 동일한 보장을 제공하는 이유다.
+
+### OOM 발생 시 resume하면서 파라미터 변경 가능 여부
+
+| 파라미터 | 역할 | resume 시 변경 가능 여부 | 근거 |
+|---|---|---|---|
+| `ppo_micro_batch_size_per_gpu` | gradient accumulation 단위 (메모리 엔지니어링) | **가능** | `batch_num_tokens`로 정규화하므로 micro-batch 크기 무관 |
+| `ppo_max_token_len_per_gpu` | dynamic bsz 상한 (메모리 엔지니어링) | **가능** | 동일한 이유 |
+| `ppo_mini_batch_size` | effective batch size (학습 하이퍼파라미터) | **변경 금지** | 변경 시 `batch_num_tokens` 자체가 달라져 gradient magnitude 변경됨 |
+
+`ppo_mini_batch_size`만 고정하면, 나머지 두 파라미터는 "같은 gradient를 어떻게 쪼개서 계산하느냐"의
+문제이므로 학습 결과에 영향을 주지 않는다.
+
+### 관련 파일 (신규 engine)
+
+- `verl/workers/engine/fsdp/transformer_impl.py:591` — `forward_backward_batch()` — batch_num_tokens 계산 위치
+- `verl/workers/utils/losses.py:58` — `ppo_loss()` — global_batch_info에 batch_num_tokens 주입
+- `verl/trainer/ppo/core_algos.py:1138` — `agg_loss()` — token-mean 정규화 구현
+- `verl/workers/engine/utils.py:59` — `prepare_micro_batches()` — dynamic bsz micro-batch 분할
