@@ -119,6 +119,48 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     model.compute_logits = MethodType(compute_logits, model)
 
 
+def _is_gemma4_vllm_model(model_obj) -> bool:
+    """True if the vLLM model class is Gemma 4 (multimodal)."""
+    if model_obj is None:
+        return False
+    return type(model_obj).__name__.startswith("Gemma4")
+
+
+def _remap_gemma4_keys(
+    weights: list[tuple[str, torch.Tensor]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Rename HF-side Gemma 4 keys to vLLM's Gemma4ForConditionalGeneration layout.
+
+    Mapping:
+      model.language_model.X  -> language_model.model.X
+      model.audio_tower.X     -> audio_tower.X
+      model.vision_tower.X    -> vision_tower.X
+      model.embed_audio.X     -> embed_audio.X
+      model.embed_vision.X    -> embed_vision.X
+      lm_head.weight          -> dropped (Gemma uses tied embeddings)
+      *.input_max/_min /
+      *.output_max/_min       -> dropped (quantization observer stats)
+
+    Without this, vLLM silently drops every weight and serves uninitialized params.
+    """
+    out: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in weights:
+        if name.endswith(("_max", "_min")):
+            continue
+        if name == "lm_head.weight":
+            continue
+
+        new_name = name
+        if name.startswith("model.language_model."):
+            new_name = "language_model.model." + name[len("model.language_model.") :]
+        elif name.startswith(
+            ("model.audio_tower.", "model.vision_tower.", "model.embed_audio.", "model.embed_vision.")
+        ):
+            new_name = name[len("model.") :]
+        out.append((new_name, tensor))
+    return out
+
+
 class vLLMColocateWorkerExtension:
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
@@ -259,6 +301,15 @@ class vLLMColocateWorkerExtension:
             self._key_diag_expected_done = True
 
         def _on_bucket(weights):
+            # Gemma 4 multimodal: HF training keys don't match vLLM's expected layout
+            # (e.g. model.language_model.* vs language_model.model.*). Remap before
+            # diagnostics + load so the diagnostic confirms the fix and load_weights
+            # actually accepts the keys.
+            if not hasattr(self, "_gemma4_remap_needed"):
+                self._gemma4_remap_needed = _is_gemma4_vllm_model(self.model_runner.model)
+            if self._gemma4_remap_needed:
+                weights = _remap_gemma4_keys(weights)
+
             if diagnostic_enabled:
                 all_received_keys.update(name for name, _ in weights)
             # [KEY_DIAG] One-time received-key dump on the first bucket.
@@ -461,6 +512,19 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             self._key_diag_expected_done = True
 
         def _on_bucket(weights):
+            # Gemma 4 multimodal: HF training keys don't match vLLM-Omni's layout.
+            # See _remap_gemma4_keys for details.
+            if not hasattr(self, "_gemma4_remap_needed"):
+                try:
+                    model_obj_local = (
+                        getattr(self, "model_runner", None) and self.model_runner.model
+                    ) or getattr(self, "model", None)
+                except Exception:
+                    model_obj_local = None
+                self._gemma4_remap_needed = _is_gemma4_vllm_model(model_obj_local)
+            if self._gemma4_remap_needed:
+                weights = _remap_gemma4_keys(weights)
+
             if diagnostic_enabled:
                 all_received_keys.update(name for name, _ in weights)
             # [KEY_DIAG] One-time received-key dump on the first bucket.
