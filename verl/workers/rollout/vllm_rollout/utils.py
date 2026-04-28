@@ -193,6 +193,12 @@ class vLLMColocateWorkerExtension:
             self.model_runner.vllm_config
         )
 
+        # Always re-apply MoE weight_loader patch. Async IPC weight sync can happen long
+        # after init and lose MoE weight_loader attrs, causing expert weights (w13/w2) to
+        # be silently skipped. Safe no-op for non-MoE models. Previously gated on the
+        # standard-load branch only — but QAT/ModelOpt MoE models need it too.
+        patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
             from verl.utils.qat import prepare_qat_for_load_weights
@@ -204,9 +210,6 @@ class vLLMColocateWorkerExtension:
 
             prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
             logger.info("ModelOpt: prepare_modelopt_for_weight_reload completed")
-        elif use_standard_weight_load:
-            # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
-            patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
         assert self.device is not None
         receiver = BucketedWeightReceiver(
@@ -214,11 +217,43 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
+
+        # Diagnostic: vLLM's load_weights silently skips unknown keys. Without aggregation
+        # across buckets we cannot tell if any sent weight was dropped. Track:
+        #   all_received - all_loaded  -> sent but vLLM didn't acknowledge -> SILENT DROP.
+        # Disable with VERL_VLLM_UPDATE_WEIGHTS_DIAGNOSTIC=0.
+        diagnostic_enabled = os.environ.get("VERL_VLLM_UPDATE_WEIGHTS_DIAGNOSTIC", "1") == "1"
+        all_received_keys: set = set()
+        all_loaded_keys: set = set()
+
+        def _on_bucket(weights):
+            if diagnostic_enabled:
+                all_received_keys.update(name for name, _ in weights)
+            loaded = self._update_weights(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
-        )
+            if diagnostic_enabled and loaded is not None:
+                all_loaded_keys.update(loaded)
+
+        receiver.receive_weights(on_bucket_received=_on_bucket)
+
+        # LoRA's add_lora has different semantics (no loaded-set) — skip the diff there.
+        if diagnostic_enabled and not (peft_config and base_sync_done):
+            unmatched = all_received_keys - all_loaded_keys
+            if unmatched:
+                sample = sorted(unmatched)[:10]
+                logger.warning(
+                    "update_weights: %d of %d sent keys were NOT acknowledged by vLLM "
+                    "load_weights — those weights were silently dropped. Sample: %s",
+                    len(unmatched),
+                    len(all_received_keys),
+                    sample,
+                )
+            else:
+                logger.info(
+                    "update_weights: all %d sent keys acknowledged by vLLM.",
+                    len(all_received_keys),
+                )
 
         if self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
@@ -239,7 +274,9 @@ class vLLMColocateWorkerExtension:
             model_config = self.model_runner.vllm_config.model_config
             process_weights_after_loading(model, model_config, self.device)
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool
+    ) -> Optional[set]:
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -251,6 +288,8 @@ class vLLMColocateWorkerExtension:
             )
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            # LoRA path: add_lora doesn't return a loaded set; coverage check N/A.
+            return None
         else:
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
@@ -259,9 +298,14 @@ class vLLMColocateWorkerExtension:
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
+                return set(loaded_params) if loaded_params is not None else set()
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
-                self.model_runner.model.load_weights(weights)
+                loaded = self.model_runner.model.load_weights(weights)
+                # vLLM's load_weights returns the set of param names actually loaded.
+                # Older versions may return None — treat as empty so the diagnostic
+                # in update_weights_from_ipc fails closed (warns about everything).
+                return set(loaded) if loaded is not None else set()
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
@@ -307,13 +351,37 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
+
+        diagnostic_enabled = os.environ.get("VERL_VLLM_UPDATE_WEIGHTS_DIAGNOSTIC", "1") == "1"
+        all_received_keys: set = set()
+        all_loaded_keys: set = set()
+
+        def _on_bucket(weights):
+            if diagnostic_enabled:
+                all_received_keys.update(name for name, _ in weights)
+            loaded = self._update_weights(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
-        )
+            if diagnostic_enabled and loaded is not None:
+                all_loaded_keys.update(loaded)
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+        receiver.receive_weights(on_bucket_received=_on_bucket)
+
+        if diagnostic_enabled and not (peft_config and base_sync_done):
+            unmatched = all_received_keys - all_loaded_keys
+            if unmatched:
+                sample = sorted(unmatched)[:10]
+                logger.warning(
+                    "update_weights (omni): %d of %d sent keys were NOT acknowledged "
+                    "by vLLM-Omni load_weights — silently dropped. Sample: %s",
+                    len(unmatched),
+                    len(all_received_keys),
+                    sample,
+                )
+
+    def _update_weights(
+        self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool
+    ) -> Optional[set]:
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = OmniTensorLoRARequest(
@@ -325,9 +393,11 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             )
             self.add_lora(lora_request)
             logger.info(f"vLLM-Omni load weights, loaded_params: {len(weights)}")
+            return None
         else:
             logger.info("Loading standard weights (async)")
-            self.load_weights(weights)
+            loaded = self.load_weights(weights)
+            return set(loaded) if loaded is not None else set()
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
