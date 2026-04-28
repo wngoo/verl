@@ -226,9 +226,77 @@ class vLLMColocateWorkerExtension:
         all_received_keys: set = set()
         all_loaded_keys: set = set()
 
+        # [KEY_DIAG] One-time dump of vLLM-expected param names. Helps debug Gemma 4 /
+        # multimodal silent-drop scenarios where the sender's key prefixes don't match
+        # what vLLM's model class registered. Disable with VERL_VLLM_KEY_DIAGNOSTIC=0.
+        key_diag_enabled = os.environ.get("VERL_VLLM_KEY_DIAGNOSTIC", "1") == "1"
+        if key_diag_enabled and not getattr(self, "_key_diag_expected_done", False):
+            try:
+                expected = sorted(dict(self.model_runner.model.named_parameters()).keys())
+                expected_prefixes = sorted({".".join(k.split(".")[:2]) for k in expected})
+                logger.warning(
+                    "[KEY_DIAG] vLLM model class: %s",
+                    type(self.model_runner.model).__name__,
+                )
+                logger.warning("[KEY_DIAG] vLLM expects %d params", len(expected))
+                logger.warning(
+                    "[KEY_DIAG] vLLM expected prefixes (top-2): %s",
+                    expected_prefixes,
+                )
+                logger.warning("[KEY_DIAG] vLLM expected sample (first 30): %s", expected[:30])
+                logger.warning(
+                    "[KEY_DIAG] vLLM has language_model=%s audio_tower=%s "
+                    "vision_tower=%s lm_head=%s",
+                    any("language_model" in k for k in expected),
+                    any("audio_tower" in k for k in expected),
+                    any("vision_tower" in k for k in expected),
+                    any("lm_head" in k for k in expected),
+                )
+                self._key_diag_expected = set(expected)
+            except Exception as e:
+                logger.warning("[KEY_DIAG] failed to enumerate vLLM params: %s", e)
+                self._key_diag_expected = None
+            self._key_diag_expected_done = True
+
         def _on_bucket(weights):
             if diagnostic_enabled:
                 all_received_keys.update(name for name, _ in weights)
+            # [KEY_DIAG] One-time received-key dump on the first bucket.
+            if key_diag_enabled and not getattr(self, "_key_diag_received_done", False):
+                bucket_keys = [name for name, _ in weights]
+                received_prefixes = sorted({".".join(k.split(".")[:2]) for k in bucket_keys})
+                logger.warning(
+                    "[KEY_DIAG] received first bucket: %d keys", len(bucket_keys)
+                )
+                logger.warning(
+                    "[KEY_DIAG] received prefixes (top-2): %s", received_prefixes
+                )
+                logger.warning(
+                    "[KEY_DIAG] received sample (first 30 sorted): %s",
+                    sorted(bucket_keys)[:30],
+                )
+                expected_set = getattr(self, "_key_diag_expected", None)
+                if expected_set is not None:
+                    received_set = set(bucket_keys)
+                    in_both = received_set & expected_set
+                    only_received = received_set - expected_set
+                    logger.warning(
+                        "[KEY_DIAG] exact-match in this bucket: %d of %d received "
+                        "keys exist verbatim in vLLM",
+                        len(in_both),
+                        len(received_set),
+                    )
+                    if only_received:
+                        logger.warning(
+                            "[KEY_DIAG] received but NOT in vLLM (sample 20): %s",
+                            sorted(only_received)[:20],
+                        )
+                    if in_both:
+                        logger.warning(
+                            "[KEY_DIAG] received AND in vLLM (sample 20): %s",
+                            sorted(in_both)[:20],
+                        )
+                self._key_diag_received_done = True
             loaded = self._update_weights(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
@@ -356,9 +424,78 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
         all_received_keys: set = set()
         all_loaded_keys: set = set()
 
+        # [KEY_DIAG] One-time dump of vLLM-Omni-expected param names. Mirrors the
+        # diagnostic in vLLMColocateWorkerExtension. Disable with VERL_VLLM_KEY_DIAGNOSTIC=0.
+        key_diag_enabled = os.environ.get("VERL_VLLM_KEY_DIAGNOSTIC", "1") == "1"
+        if key_diag_enabled and not getattr(self, "_key_diag_expected_done", False):
+            try:
+                # Omni path: self.load_weights is the entry; named_parameters lives on
+                # whichever module owns the vLLM model. Try a few attribute paths.
+                model_obj = (
+                    getattr(self, "model_runner", None) and self.model_runner.model
+                ) or getattr(self, "model", None)
+                if model_obj is None:
+                    raise AttributeError("no model_runner.model or self.model on omni worker")
+                expected = sorted(dict(model_obj.named_parameters()).keys())
+                expected_prefixes = sorted({".".join(k.split(".")[:2]) for k in expected})
+                logger.warning("[KEY_DIAG omni] vLLM model class: %s", type(model_obj).__name__)
+                logger.warning("[KEY_DIAG omni] vLLM expects %d params", len(expected))
+                logger.warning(
+                    "[KEY_DIAG omni] vLLM expected prefixes (top-2): %s", expected_prefixes
+                )
+                logger.warning(
+                    "[KEY_DIAG omni] vLLM expected sample (first 30): %s", expected[:30]
+                )
+                logger.warning(
+                    "[KEY_DIAG omni] vLLM has language_model=%s audio_tower=%s "
+                    "vision_tower=%s lm_head=%s",
+                    any("language_model" in k for k in expected),
+                    any("audio_tower" in k for k in expected),
+                    any("vision_tower" in k for k in expected),
+                    any("lm_head" in k for k in expected),
+                )
+                self._key_diag_expected = set(expected)
+            except Exception as e:
+                logger.warning("[KEY_DIAG omni] failed to enumerate vLLM params: %s", e)
+                self._key_diag_expected = None
+            self._key_diag_expected_done = True
+
         def _on_bucket(weights):
             if diagnostic_enabled:
                 all_received_keys.update(name for name, _ in weights)
+            # [KEY_DIAG] One-time received-key dump on the first bucket.
+            if key_diag_enabled and not getattr(self, "_key_diag_received_done", False):
+                bucket_keys = [name for name, _ in weights]
+                received_prefixes = sorted({".".join(k.split(".")[:2]) for k in bucket_keys})
+                logger.warning("[KEY_DIAG omni] received first bucket: %d keys", len(bucket_keys))
+                logger.warning(
+                    "[KEY_DIAG omni] received prefixes (top-2): %s", received_prefixes
+                )
+                logger.warning(
+                    "[KEY_DIAG omni] received sample (first 30 sorted): %s",
+                    sorted(bucket_keys)[:30],
+                )
+                expected_set = getattr(self, "_key_diag_expected", None)
+                if expected_set is not None:
+                    received_set = set(bucket_keys)
+                    in_both = received_set & expected_set
+                    only_received = received_set - expected_set
+                    logger.warning(
+                        "[KEY_DIAG omni] exact-match in this bucket: %d of %d",
+                        len(in_both),
+                        len(received_set),
+                    )
+                    if only_received:
+                        logger.warning(
+                            "[KEY_DIAG omni] received but NOT in vLLM (sample 20): %s",
+                            sorted(only_received)[:20],
+                        )
+                    if in_both:
+                        logger.warning(
+                            "[KEY_DIAG omni] received AND in vLLM (sample 20): %s",
+                            sorted(in_both)[:20],
+                        )
+                self._key_diag_received_done = True
             loaded = self._update_weights(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
