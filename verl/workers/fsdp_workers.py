@@ -788,6 +788,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
             params = self.actor_module_fsdp.state_dict()
+            # state_dict() omits non-persistent buffers (registered with persistent=False).
+            # If the trainer model has any (e.g. RoPE inv_freq, RMSNorm caches in some
+            # implementations), they would never be transferred. Add them explicitly so
+            # vLLM sees the full set; named_buffers() returns persistent + non-persistent.
+            for buf_name, buf in self.actor_module_fsdp.named_buffers():
+                if buf_name not in params:
+                    params[buf_name] = buf
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)

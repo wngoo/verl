@@ -119,6 +119,48 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     model.compute_logits = MethodType(compute_logits, model)
 
 
+def _is_gemma4_vllm_model(model_obj) -> bool:
+    """True if the vLLM model class is Gemma 4 (multimodal)."""
+    if model_obj is None:
+        return False
+    return type(model_obj).__name__.startswith("Gemma4")
+
+
+def _remap_gemma4_keys(
+    weights: list[tuple[str, torch.Tensor]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Rename HF-side Gemma 4 keys to vLLM's Gemma4ForConditionalGeneration layout.
+
+    Mapping:
+      model.language_model.X  -> language_model.model.X
+      model.audio_tower.X     -> audio_tower.X
+      model.vision_tower.X    -> vision_tower.X
+      model.embed_audio.X     -> embed_audio.X
+      model.embed_vision.X    -> embed_vision.X
+      lm_head.weight          -> dropped (Gemma uses tied embeddings)
+      *.input_max/_min /
+      *.output_max/_min       -> dropped (quantization observer stats)
+
+    Without this, vLLM silently drops every weight and serves uninitialized params.
+    """
+    out: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in weights:
+        if name.endswith(("_max", "_min")):
+            continue
+        if name == "lm_head.weight":
+            continue
+
+        new_name = name
+        if name.startswith("model.language_model."):
+            new_name = "language_model.model." + name[len("model.language_model.") :]
+        elif name.startswith(
+            ("model.audio_tower.", "model.vision_tower.", "model.embed_audio.", "model.embed_vision.")
+        ):
+            new_name = name[len("model.") :]
+        out.append((new_name, tensor))
+    return out
+
+
 class vLLMColocateWorkerExtension:
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
@@ -193,6 +235,12 @@ class vLLMColocateWorkerExtension:
             self.model_runner.vllm_config
         )
 
+        # Always re-apply MoE weight_loader patch. Async IPC weight sync can happen long
+        # after init and lose MoE weight_loader attrs, causing expert weights (w13/w2) to
+        # be silently skipped. Safe no-op for non-MoE models. Previously gated on the
+        # standard-load branch only — but QAT/ModelOpt MoE models need it too.
+        patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
             from verl.utils.qat import prepare_qat_for_load_weights
@@ -204,9 +252,6 @@ class vLLMColocateWorkerExtension:
 
             prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
             logger.info("ModelOpt: prepare_modelopt_for_weight_reload completed")
-        elif use_standard_weight_load:
-            # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
-            patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
         assert self.device is not None
         receiver = BucketedWeightReceiver(
@@ -214,11 +259,120 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
+
+        # Diagnostic: vLLM's load_weights silently skips unknown keys. Without aggregation
+        # across buckets we cannot tell if any sent weight was dropped. Track:
+        #   all_received - all_loaded  -> sent but vLLM didn't acknowledge -> SILENT DROP.
+        # Disable with VERL_VLLM_UPDATE_WEIGHTS_DIAGNOSTIC=0.
+        diagnostic_enabled = os.environ.get("VERL_VLLM_UPDATE_WEIGHTS_DIAGNOSTIC", "1") == "1"
+        all_received_keys: set = set()
+        all_loaded_keys: set = set()
+
+        # [KEY_DIAG] One-time dump of vLLM-expected param names. Helps debug Gemma 4 /
+        # multimodal silent-drop scenarios where the sender's key prefixes don't match
+        # what vLLM's model class registered. Disable with VERL_VLLM_KEY_DIAGNOSTIC=0.
+        key_diag_enabled = os.environ.get("VERL_VLLM_KEY_DIAGNOSTIC", "1") == "1"
+        if key_diag_enabled and not getattr(self, "_key_diag_expected_done", False):
+            try:
+                expected = sorted(dict(self.model_runner.model.named_parameters()).keys())
+                expected_prefixes = sorted({".".join(k.split(".")[:2]) for k in expected})
+                logger.warning(
+                    "[KEY_DIAG] vLLM model class: %s",
+                    type(self.model_runner.model).__name__,
+                )
+                logger.warning("[KEY_DIAG] vLLM expects %d params", len(expected))
+                logger.warning(
+                    "[KEY_DIAG] vLLM expected prefixes (top-2): %s",
+                    expected_prefixes,
+                )
+                logger.warning("[KEY_DIAG] vLLM expected sample (first 30): %s", expected[:30])
+                logger.warning(
+                    "[KEY_DIAG] vLLM has language_model=%s audio_tower=%s "
+                    "vision_tower=%s lm_head=%s",
+                    any("language_model" in k for k in expected),
+                    any("audio_tower" in k for k in expected),
+                    any("vision_tower" in k for k in expected),
+                    any("lm_head" in k for k in expected),
+                )
+                self._key_diag_expected = set(expected)
+            except Exception as e:
+                logger.warning("[KEY_DIAG] failed to enumerate vLLM params: %s", e)
+                self._key_diag_expected = None
+            self._key_diag_expected_done = True
+
+        def _on_bucket(weights):
+            # Gemma 4 multimodal: HF training keys don't match vLLM's expected layout
+            # (e.g. model.language_model.* vs language_model.model.*). Remap before
+            # diagnostics + load so the diagnostic confirms the fix and load_weights
+            # actually accepts the keys.
+            if not hasattr(self, "_gemma4_remap_needed"):
+                self._gemma4_remap_needed = _is_gemma4_vllm_model(self.model_runner.model)
+            if self._gemma4_remap_needed:
+                weights = _remap_gemma4_keys(weights)
+
+            if diagnostic_enabled:
+                all_received_keys.update(name for name, _ in weights)
+            # [KEY_DIAG] One-time received-key dump on the first bucket.
+            if key_diag_enabled and not getattr(self, "_key_diag_received_done", False):
+                bucket_keys = [name for name, _ in weights]
+                received_prefixes = sorted({".".join(k.split(".")[:2]) for k in bucket_keys})
+                logger.warning(
+                    "[KEY_DIAG] received first bucket: %d keys", len(bucket_keys)
+                )
+                logger.warning(
+                    "[KEY_DIAG] received prefixes (top-2): %s", received_prefixes
+                )
+                logger.warning(
+                    "[KEY_DIAG] received sample (first 30 sorted): %s",
+                    sorted(bucket_keys)[:30],
+                )
+                expected_set = getattr(self, "_key_diag_expected", None)
+                if expected_set is not None:
+                    received_set = set(bucket_keys)
+                    in_both = received_set & expected_set
+                    only_received = received_set - expected_set
+                    logger.warning(
+                        "[KEY_DIAG] exact-match in this bucket: %d of %d received "
+                        "keys exist verbatim in vLLM",
+                        len(in_both),
+                        len(received_set),
+                    )
+                    if only_received:
+                        logger.warning(
+                            "[KEY_DIAG] received but NOT in vLLM (sample 20): %s",
+                            sorted(only_received)[:20],
+                        )
+                    if in_both:
+                        logger.warning(
+                            "[KEY_DIAG] received AND in vLLM (sample 20): %s",
+                            sorted(in_both)[:20],
+                        )
+                self._key_diag_received_done = True
+            loaded = self._update_weights(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
-        )
+            if diagnostic_enabled and loaded is not None:
+                all_loaded_keys.update(loaded)
+
+        receiver.receive_weights(on_bucket_received=_on_bucket)
+
+        # LoRA's add_lora has different semantics (no loaded-set) — skip the diff there.
+        if diagnostic_enabled and not (peft_config and base_sync_done):
+            unmatched = all_received_keys - all_loaded_keys
+            if unmatched:
+                sample = sorted(unmatched)[:10]
+                logger.warning(
+                    "update_weights: %d of %d sent keys were NOT acknowledged by vLLM "
+                    "load_weights — those weights were silently dropped. Sample: %s",
+                    len(unmatched),
+                    len(all_received_keys),
+                    sample,
+                )
+            else:
+                logger.info(
+                    "update_weights: all %d sent keys acknowledged by vLLM.",
+                    len(all_received_keys),
+                )
 
         if self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
@@ -239,7 +393,9 @@ class vLLMColocateWorkerExtension:
             model_config = self.model_runner.vllm_config.model_config
             process_weights_after_loading(model, model_config, self.device)
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool
+    ) -> Optional[set]:
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -251,6 +407,8 @@ class vLLMColocateWorkerExtension:
             )
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            # LoRA path: add_lora doesn't return a loaded set; coverage check N/A.
+            return None
         else:
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
@@ -259,9 +417,14 @@ class vLLMColocateWorkerExtension:
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
+                return set(loaded_params) if loaded_params is not None else set()
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
-                self.model_runner.model.load_weights(weights)
+                loaded = self.model_runner.model.load_weights(weights)
+                # vLLM's load_weights returns the set of param names actually loaded.
+                # Older versions may return None — treat as empty so the diagnostic
+                # in update_weights_from_ipc fails closed (warns about everything).
+                return set(loaded) if loaded is not None else set()
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
@@ -307,13 +470,119 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
+
+        diagnostic_enabled = os.environ.get("VERL_VLLM_UPDATE_WEIGHTS_DIAGNOSTIC", "1") == "1"
+        all_received_keys: set = set()
+        all_loaded_keys: set = set()
+
+        # [KEY_DIAG] One-time dump of vLLM-Omni-expected param names. Mirrors the
+        # diagnostic in vLLMColocateWorkerExtension. Disable with VERL_VLLM_KEY_DIAGNOSTIC=0.
+        key_diag_enabled = os.environ.get("VERL_VLLM_KEY_DIAGNOSTIC", "1") == "1"
+        if key_diag_enabled and not getattr(self, "_key_diag_expected_done", False):
+            try:
+                # Omni path: self.load_weights is the entry; named_parameters lives on
+                # whichever module owns the vLLM model. Try a few attribute paths.
+                model_obj = (
+                    getattr(self, "model_runner", None) and self.model_runner.model
+                ) or getattr(self, "model", None)
+                if model_obj is None:
+                    raise AttributeError("no model_runner.model or self.model on omni worker")
+                expected = sorted(dict(model_obj.named_parameters()).keys())
+                expected_prefixes = sorted({".".join(k.split(".")[:2]) for k in expected})
+                logger.warning("[KEY_DIAG omni] vLLM model class: %s", type(model_obj).__name__)
+                logger.warning("[KEY_DIAG omni] vLLM expects %d params", len(expected))
+                logger.warning(
+                    "[KEY_DIAG omni] vLLM expected prefixes (top-2): %s", expected_prefixes
+                )
+                logger.warning(
+                    "[KEY_DIAG omni] vLLM expected sample (first 30): %s", expected[:30]
+                )
+                logger.warning(
+                    "[KEY_DIAG omni] vLLM has language_model=%s audio_tower=%s "
+                    "vision_tower=%s lm_head=%s",
+                    any("language_model" in k for k in expected),
+                    any("audio_tower" in k for k in expected),
+                    any("vision_tower" in k for k in expected),
+                    any("lm_head" in k for k in expected),
+                )
+                self._key_diag_expected = set(expected)
+            except Exception as e:
+                logger.warning("[KEY_DIAG omni] failed to enumerate vLLM params: %s", e)
+                self._key_diag_expected = None
+            self._key_diag_expected_done = True
+
+        def _on_bucket(weights):
+            # Gemma 4 multimodal: HF training keys don't match vLLM-Omni's layout.
+            # See _remap_gemma4_keys for details.
+            if not hasattr(self, "_gemma4_remap_needed"):
+                try:
+                    model_obj_local = (
+                        getattr(self, "model_runner", None) and self.model_runner.model
+                    ) or getattr(self, "model", None)
+                except Exception:
+                    model_obj_local = None
+                self._gemma4_remap_needed = _is_gemma4_vllm_model(model_obj_local)
+            if self._gemma4_remap_needed:
+                weights = _remap_gemma4_keys(weights)
+
+            if diagnostic_enabled:
+                all_received_keys.update(name for name, _ in weights)
+            # [KEY_DIAG] One-time received-key dump on the first bucket.
+            if key_diag_enabled and not getattr(self, "_key_diag_received_done", False):
+                bucket_keys = [name for name, _ in weights]
+                received_prefixes = sorted({".".join(k.split(".")[:2]) for k in bucket_keys})
+                logger.warning("[KEY_DIAG omni] received first bucket: %d keys", len(bucket_keys))
+                logger.warning(
+                    "[KEY_DIAG omni] received prefixes (top-2): %s", received_prefixes
+                )
+                logger.warning(
+                    "[KEY_DIAG omni] received sample (first 30 sorted): %s",
+                    sorted(bucket_keys)[:30],
+                )
+                expected_set = getattr(self, "_key_diag_expected", None)
+                if expected_set is not None:
+                    received_set = set(bucket_keys)
+                    in_both = received_set & expected_set
+                    only_received = received_set - expected_set
+                    logger.warning(
+                        "[KEY_DIAG omni] exact-match in this bucket: %d of %d",
+                        len(in_both),
+                        len(received_set),
+                    )
+                    if only_received:
+                        logger.warning(
+                            "[KEY_DIAG omni] received but NOT in vLLM (sample 20): %s",
+                            sorted(only_received)[:20],
+                        )
+                    if in_both:
+                        logger.warning(
+                            "[KEY_DIAG omni] received AND in vLLM (sample 20): %s",
+                            sorted(in_both)[:20],
+                        )
+                self._key_diag_received_done = True
+            loaded = self._update_weights(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
-        )
+            if diagnostic_enabled and loaded is not None:
+                all_loaded_keys.update(loaded)
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+        receiver.receive_weights(on_bucket_received=_on_bucket)
+
+        if diagnostic_enabled and not (peft_config and base_sync_done):
+            unmatched = all_received_keys - all_loaded_keys
+            if unmatched:
+                sample = sorted(unmatched)[:10]
+                logger.warning(
+                    "update_weights (omni): %d of %d sent keys were NOT acknowledged "
+                    "by vLLM-Omni load_weights — silently dropped. Sample: %s",
+                    len(unmatched),
+                    len(all_received_keys),
+                    sample,
+                )
+
+    def _update_weights(
+        self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool
+    ) -> Optional[set]:
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = OmniTensorLoRARequest(
@@ -325,9 +594,11 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             )
             self.add_lora(lora_request)
             logger.info(f"vLLM-Omni load weights, loaded_params: {len(weights)}")
+            return None
         else:
             logger.info("Loading standard weights (async)")
-            self.load_weights(weights)
+            loaded = self.load_weights(weights)
+            return set(loaded) if loaded is not None else set()
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
