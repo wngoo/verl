@@ -916,7 +916,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
             # pad and slice the inputs if sp > 1
             if self.use_ulysses_sp:
-                is_vlm_model = hasattr(getattr(self.module, "module", self.module).config, "vision_config")
+                # Only treat as VLM when there are actual vision inputs.
+                # Models like Gemma4 have `vision_config` but don't implement
+                # the slice-after-embedding pattern for text-only inference,
+                # so using the VLM path without vision inputs causes a shape
+                # mismatch between logits (full total_nnz) and sliced temperature.
+                is_vlm_model = (
+                    hasattr(getattr(self.module, "module", self.module).config, "vision_config")
+                    and bool(multi_modal_inputs)
+                )
                 if is_vlm_model:
                     # vlm model's inputs will be sliced after embedding
                     input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(

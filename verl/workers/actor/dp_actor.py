@@ -677,6 +677,25 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+
+                # Weight magnitude diagnostics for actor/entropy spike investigation.
+                # Sampled every 50 mini-batch steps to amortize the full-parameter sweep cost.
+                # A growing weight_l2 or spiking weight_max_abs indicates optimizer/bf16
+                # divergence — a common upstream cause of distribution flattening.
+                step = getattr(self, "_weight_log_step", 0)
+                if step % 50 == 0:
+                    with torch.no_grad():
+                        total_sq = 0.0
+                        max_abs = 0.0
+                        for p in self.actor_module.parameters():
+                            if p.requires_grad:
+                                p_local = p.to_local() if isinstance(p, DTensor) else p
+                                total_sq += p_local.detach().float().pow(2).sum().item()
+                                max_abs = max(max_abs, p_local.detach().abs().max().item())
+                    mini_batch_metrics["actor/weight_l2"] = total_sq ** 0.5
+                    mini_batch_metrics["actor/weight_max_abs"] = max_abs
+                self._weight_log_step = step + 1
+
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

@@ -121,6 +121,20 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss -= entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
+        # Entropy distribution diagnostics: separate collapse (whole distribution flattens)
+        # from outlier-token spikes. If mean and p50/p90 rise together → collapse.
+        # If only max/p99 rise → a few outlier tokens (masking / EOS-adjacent / boundary).
+        with torch.no_grad():
+            ent_resp = entropy[response_mask]
+            if ent_resp.numel() > 0:
+                ent_f = ent_resp.float()
+                qs = torch.quantile(ent_f, torch.tensor([0.5, 0.9, 0.99], device=ent_f.device))
+                metrics["actor/entropy_p50"] = Metric(value=qs[0], aggregation=AggregationType.MEAN)
+                metrics["actor/entropy_p90"] = Metric(value=qs[1], aggregation=AggregationType.MEAN)
+                metrics["actor/entropy_p99"] = Metric(value=qs[2], aggregation=AggregationType.MEAN)
+                metrics["actor/entropy_max"] = Metric(value=ent_f.max(), aggregation=AggregationType.MAX)
+                metrics["actor/entropy_std"] = Metric(value=ent_f.std(), aggregation=AggregationType.MEAN)
+
     # add kl loss
     if config.use_kl_loss:
         ref_log_prob = data["ref_log_prob"]

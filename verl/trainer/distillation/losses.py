@@ -351,4 +351,29 @@ def compute_distillation_loss_reverse_kl_estimator(
     metrics = {
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
+
+    # Saturation / gap diagnostics for actor/entropy spike investigation.
+    # k1 = exp(student_logp - teacher_logp) - 1, so the gap distribution drives the
+    # learning signal. clamp_fraction shows when loss_max_clamp turns the advantage
+    # into a near-binary ±clamp signal (high gradient noise → entropy ↑).
+    with torch.no_grad():
+        gap = (student_log_probs - teacher_log_probs)[response_mask_bool].float()
+        if gap.numel() > 0:
+            gap_qs = torch.quantile(gap, torch.tensor([0.01, 0.99], device=gap.device))
+            metrics["distillation/logprob_gap_mean"] = Metric(AggregationType.MEAN, gap.mean())
+            metrics["distillation/logprob_gap_p01"] = Metric(AggregationType.MEAN, gap_qs[0])
+            metrics["distillation/logprob_gap_p99"] = Metric(AggregationType.MEAN, gap_qs[1])
+            metrics["distillation/student_logprob_min"] = Metric(
+                AggregationType.MIN, student_log_probs[response_mask_bool].min()
+            )
+            metrics["distillation/teacher_logprob_min"] = Metric(
+                AggregationType.MIN, teacher_log_probs[response_mask_bool].min()
+            )
+        if loss_config.loss_max_clamp is not None:
+            raw_losses = distillation_losses[response_mask_bool].float()
+            clamp_frac = (
+                (raw_losses > loss_config.loss_max_clamp) | (raw_losses < -loss_config.loss_max_clamp)
+            ).float().mean()
+            metrics["distillation/clamp_fraction"] = Metric(AggregationType.MEAN, clamp_frac)
+
     return distillation_losses, metrics
